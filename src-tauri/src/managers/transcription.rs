@@ -1319,25 +1319,49 @@ impl TranscriptionManager {
             run_options.family.is_some()
         );
 
-        let transcript = match self.engine.transcribe(audio, run_options) {
-            Ok(transcript) => transcript,
-            Err(EngineError::Cancelled) => return Err(EngineError::Cancelled.into()),
-            Err(e) => {
-                self.forget_model_if_engine_dropped(active_model, &e.to_string());
-                return Err(anyhow::anyhow!(
-                    "transcribe-cpp transcription failed: {}",
-                    e
-                ));
-            }
+        // Cohere decodes the whole clip in one autoregressive pass and drops
+        // the middle of anything much past ~35s (transcribe.cpp#128), so feed
+        // it silence-aligned chunks and stitch the text back together.
+        let chunks = if info.arch == "cohere_asr" {
+            long_form_chunks(&audio, COHERE_MAX_CHUNK_SAMPLES)
+        } else {
+            vec![0..audio.len()]
         };
+        if chunks.len() > 1 {
+            debug!(
+                "Cohere long-form: splitting audio into {} chunks",
+                chunks.len()
+            );
+        }
+
+        let mut texts = Vec::with_capacity(chunks.len());
+        let mut model_detected_language = None;
+        for range in chunks {
+            let transcript = match self
+                .engine
+                .transcribe(audio[range].to_vec(), run_options.clone())
+            {
+                Ok(transcript) => transcript,
+                Err(EngineError::Cancelled) => return Err(EngineError::Cancelled.into()),
+                Err(e) => {
+                    self.forget_model_if_engine_dropped(active_model, &e.to_string());
+                    return Err(anyhow::anyhow!(
+                        "transcribe-cpp transcription failed: {}",
+                        e
+                    ));
+                }
+            };
+            model_detected_language = model_detected_language.or(transcript.language);
+            texts.push(transcript.text);
+        }
         Ok(RunOutcome {
-            text: transcript.text,
+            text: join_chunk_texts(texts),
             languages,
             applied_language_hint,
             output_was_translated,
             // Whisper's audio-based LID (auto mode only; `None` when a
             // language hint was passed).
-            model_detected_language: transcript.language,
+            model_detected_language,
             model_is_whisper,
         })
     }
@@ -1448,10 +1472,15 @@ impl TranscriptionManager {
                         language: lang,
                         ..Default::default()
                     };
-                    cohere_engine
-                        .transcribe(audio, &options)
-                        .map(|r| r.text)
-                        .map_err(|e| anyhow::anyhow!("Cohere transcription failed: {}", e))
+                    let mut texts = Vec::new();
+                    for range in long_form_chunks(audio, COHERE_MAX_CHUNK_SAMPLES) {
+                        let text = cohere_engine
+                            .transcribe(&audio[range], &options)
+                            .map(|r| r.text)
+                            .map_err(|e| anyhow::anyhow!("Cohere transcription failed: {}", e))?;
+                        texts.push(text);
+                    }
+                    Ok(join_chunk_texts(texts))
                 }
             }
         }));
@@ -1524,6 +1553,43 @@ struct RunOutcome {
     /// INVALID_ARG, so the whisper extension must be gated on the arch, not
     /// on the feature (see #1601).
     model_is_whisper: bool,
+}
+
+/// Longest clip handed to Cohere in one pass. Its reference processor uses
+/// ~35s windows; stay under that so the cut point search has headroom.
+const COHERE_MAX_CHUNK_SAMPLES: usize = 28 * 16_000;
+
+/// Split 16 kHz audio into ranges of at most `max_samples`, cutting each at the
+/// quietest 100ms frame in the last third of the window so words aren't split.
+fn long_form_chunks(audio: &[f32], max_samples: usize) -> Vec<std::ops::Range<usize>> {
+    const FRAME: usize = 1_600;
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    while audio.len() - start > max_samples {
+        let window_end = start + max_samples;
+        let search_start = window_end - max_samples / 3;
+        let cut = (search_start..window_end - FRAME)
+            .step_by(FRAME / 2)
+            .min_by(|&a, &b| {
+                let energy = |i: usize| audio[i..i + FRAME].iter().map(|s| s * s).sum::<f32>();
+                energy(a).total_cmp(&energy(b))
+            })
+            .map(|i| i + FRAME / 2)
+            .unwrap_or(window_end);
+        ranges.push(start..cut);
+        start = cut;
+    }
+    ranges.push(start..audio.len());
+    ranges
+}
+
+fn join_chunk_texts(texts: Vec<String>) -> String {
+    texts
+        .iter()
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn emit_stream_text(app_handle: &AppHandle, committed: &str, tentative: &str) {
@@ -2467,6 +2533,35 @@ mod tests {
         );
 
         assert_eq!(evidence, OutputLanguageEvidence::TranslatedToEnglish);
+    }
+
+    #[test]
+    fn long_form_chunks_cut_at_silence_and_cover_all_audio() {
+        let max = 28 * 16_000;
+        let mut audio = vec![0.5_f32; 70 * 16_000];
+        // Silence at 24s and 50s; the splitter should cut inside each gap.
+        audio[24 * 16_000..24 * 16_000 + 4_000].fill(0.0);
+        audio[50 * 16_000..50 * 16_000 + 4_000].fill(0.0);
+        let chunks = long_form_chunks(&audio, max);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].start, 0);
+        assert_eq!(chunks.last().unwrap().end, audio.len());
+        for pair in chunks.windows(2) {
+            assert_eq!(pair[0].end, pair[1].start);
+        }
+        for c in &chunks {
+            assert!(c.len() <= max);
+        }
+        assert!((24 * 16_000..24 * 16_000 + 4_000).contains(&chunks[0].end));
+        assert!((50 * 16_000..50 * 16_000 + 4_000).contains(&chunks[1].end));
+    }
+
+    #[test]
+    fn short_audio_is_a_single_chunk() {
+        assert_eq!(
+            long_form_chunks(&[0.1; 16_000], 28 * 16_000),
+            vec![0..16_000]
+        );
     }
 
     #[test]
